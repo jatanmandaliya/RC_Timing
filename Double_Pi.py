@@ -1,114 +1,365 @@
 #!/usr/bin/env python3
-# double_pi_gui.py — GUI to compute a Double-π equivalent from manual Rs/Cs.
-# Modified to handle any number of resistors and capacitors independently.
+# double_pi_parser.py - Parse SPICE file and compute Double-π equivalent
+# Similar structure to PI_MODEL.py but for Double-π networks
 
-import tkinter as tk
-from tkinter import messagebox, filedialog
-from pathlib import Path
-import math
-
-
-# ---------- helpers ----------
-def parse_list(csv: str):
-    csv = csv.strip()
-    if not csv:
-        return []
-    try:
-        return [float(x.strip()) for x in csv.split(",") if x.strip()]
-    except ValueError:
-        raise ValueError("Enter comma-separated floats (e.g., 50,75,30).")
+class Node:
+    def __init__(self, component_type, value, node1=None, node2=None):
+        self.component_type = component_type
+        self.value = value
+        self.node1 = node1
+        self.node2 = node2
+        self.next = None
 
 
-# ---------- exact detection: "already double-π" ----------
-def detect_exact_double_pi(Rs, Cs, tol=1e-12):
+class LinkedList:
+    def __init__(self):
+        self.head = None
+
+    def append(self, component_type, value, node1=None, node2=None):
+        if not self.head:
+            self.head = Node(component_type, value, node1, node2)
+        else:
+            current = self.head
+            while current.next:
+                current = current.next
+            current.next = Node(component_type, value, node1, node2)
+
+
+def parse_hspice_file(filename):
     """
-    Simple and robust grouping for double-pi topology.
-
-    Logic:
-    1. Find exactly 2 non-zero resistors (R1, R2)
-    2. Group capacitors into 3 sections based on position
-    3. Sum capacitors in each section
-
-    Works for any len(Cs) and len(Rs) relationship.
+    Parse SPICE file and extract resistors and capacitors.
+    Returns two lists: Rs (resistors) and Cs (capacitors) in order.
     """
-    # Find non-zero resistors and their positions
-    nz_data = [(i, R) for i, R in enumerate(Rs) if abs(R) >= tol]
-    if len(nz_data) != 2:
-        return None  # need exactly 2 non-zero resistors
+    linked_list = LinkedList()
+    components = []
 
-    (i1, R1), (i2, R2) = nz_data
+    with open(filename, "r") as f:
+        lines = f.readlines()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("R") or line.startswith("C"):
+                parts = line.split()
+                if len(parts) >= 4:
+                    component_name = parts[0]
+                    component_type = parts[0][0]  # 'R' or 'C'
+                    node1 = parts[1]
+                    node2 = parts[2]
+                    try:
+                        value = float(parts[3])
+                        components.append((component_name, component_type, value, node1, node2))
+                        linked_list.append(component_type, value, node1, node2)
+                    except ValueError:
+                        pass  # Skip if value cannot be converted to float
 
-    # Simple sectioning approach:
-    # Divide capacitor array into 3 roughly equal sections
-    # This works regardless of the relationship between len(Cs) and len(Rs)
+    # Sort components by name to maintain order (R1, R2, C1, C2, etc.)
+    components.sort(key=lambda x: x[0])
 
-    n_caps = len(Cs)
-    if n_caps < 3:
-        return None  # need at least 3 capacitors
+    # Separate into resistors and capacitors lists
+    Rs = []
+    Cs = []
 
-    # Calculate section boundaries
-    section_size = n_caps // 3
-    remainder = n_caps % 3
+    for comp in components:
+        comp_name, comp_type, value, n1, n2 = comp
+        if comp_type == 'R':
+            Rs.append(value)
+        elif comp_type == 'C':
+            Cs.append(value)
 
-    # Distribute remainder among first sections
-    if remainder == 0:
-        # Equal sections: [0:s], [s:2s], [2s:end]
-        b1, b2 = section_size, 2 * section_size
-    elif remainder == 1:
-        # Give extra to first section: [0:s+1], [s+1:2s+1], [2s+1:end]
-        b1, b2 = section_size + 1, 2 * section_size + 1
-    else:  # remainder == 2
-        # Give extra to first two: [0:s+1], [s+1:2s+2], [2s+2:end]
-        b1, b2 = section_size + 1, 2 * section_size + 2
+    return linked_list, Rs, Cs, components
 
-    # Sum capacitors in each section
-    C1 = sum(Cs[0:b1])
-    C2 = sum(Cs[b1:b2])
-    C3 = sum(Cs[b2:])
 
-    # Sanity check: keep passive
-    if R1 <= 0 or R2 <= 0 or C1 < 0 or C2 < 0 or C3 < 0:
+def detect_exact_double_pi_from_spice(components, tol=1e-12):
+    """
+    Analyze SPICE components to detect double-π structure.
+    Groups capacitors based on actual circuit topology with zero-ohm shorts.
+    """
+    # Build node-to-components mapping
+    node_caps = {}  # node -> list of capacitor values
+    all_resistors = []  # (from_node, to_node, value)
+
+    for comp_name, comp_type, value, node1, node2 in components:
+        if comp_type == 'C':
+            # Capacitor from node to ground
+            if node2 == '0':  # to ground
+                if node1 not in node_caps:
+                    node_caps[node1] = []
+                node_caps[node1].append(value)
+            elif node1 == '0':  # from ground (reverse)
+                if node2 not in node_caps:
+                    node_caps[node2] = []
+                node_caps[node2].append(value)
+        elif comp_type == 'R':
+            all_resistors.append((node1, node2, value))
+
+    # Find non-zero resistors
+    nonzero_resistors = [(n1, n2, val) for n1, n2, val in all_resistors if abs(val) >= tol]
+    zero_resistors = [(n1, n2, val) for n1, n2, val in all_resistors if abs(val) < tol]
+
+    if len(nonzero_resistors) != 2:
         return None
 
+    print(f"Debug: Non-zero resistors: {nonzero_resistors}")
+    print(f"Debug: Zero resistors: {zero_resistors}")
+    print(f"Debug: Node capacitors: {node_caps}")
+
+    # Build zero-ohm connectivity groups
+    def find_connected_nodes(start_node):
+        """Find all nodes connected to start_node through zero-ohm resistors."""
+        connected = {start_node}
+        changed = True
+        while changed:
+            changed = False
+            for n1, n2, val in zero_resistors:
+                if n1 in connected and n2 not in connected:
+                    connected.add(n2)
+                    changed = True
+                elif n2 in connected and n1 not in connected:
+                    connected.add(n1)
+                    changed = True
+        return connected
+
+    # Find all unique zero-ohm groups
+    all_nodes = set()
+    for n1, n2, val in all_resistors:
+        if n1 != '0':
+            all_nodes.add(n1)
+        if n2 != '0':
+            all_nodes.add(n2)
+
+    visited = set()
+    groups = []
+    for node in all_nodes:
+        if node not in visited:
+            group = find_connected_nodes(node)
+            group.discard('0')  # Remove ground
+            if group:
+                groups.append(group)
+                visited.update(group)
+
+    print(f"Debug: Zero-ohm connected groups: {[list(g) for g in groups]}")
+
+    # Calculate capacitor sum for each group
+    group_caps = []
+    for group in groups:
+        cap_sum = sum(sum(node_caps.get(node, [])) for node in group)
+        group_caps.append((group, cap_sum))
+
+    print(f"Debug: Groups with capacitor sums: {[(list(g), c) for g, c in group_caps]}")
+
+    # Build adjacency based on non-zero resistors
+    group_adjacency = {}
+
+    for i, (group1, cap1) in enumerate(group_caps):
+        group_adjacency[i] = []
+        for r_from, r_to, r_val in nonzero_resistors:
+            for j, (group2, cap2) in enumerate(group_caps):
+                if i != j:
+                    # Check if this resistor connects group i to group j
+                    connects = False
+                    if (r_from in group1 and r_to in group2) or (r_to in group1 and r_from in group2):
+                        connects = True
+
+                    if connects:
+                        group_adjacency[i].append((j, r_val))
+
+    print(f"Debug: Group adjacency: {group_adjacency}")
+
+    # Find the linear path: start -> middle -> end
+    # The middle group connects to 2 other groups, start and end connect to 1 each
+    start_group = middle_group = end_group = None
+
+    for i, connections in group_adjacency.items():
+        if len(connections) == 2:
+            middle_group = i
+        elif len(connections) == 1:
+            if start_group is None:
+                start_group = i
+            else:
+                end_group = i
+
+    if start_group is not None and middle_group is not None and end_group is not None:
+        # Extract the results
+        C1 = group_caps[start_group][1]
+        C2 = group_caps[middle_group][1]
+        C3 = group_caps[end_group][1]
+
+        # Get resistor values by checking which resistors connect the groups
+        R1 = R2 = None
+        for r_from, r_to, r_val in nonzero_resistors:
+            start_nodes = group_caps[start_group][0]
+            middle_nodes = group_caps[middle_group][0]
+            end_nodes = group_caps[end_group][0]
+
+            if ((r_from in start_nodes and r_to in middle_nodes) or
+                    (r_to in start_nodes and r_from in middle_nodes)):
+                R1 = r_val
+            elif ((r_from in middle_nodes and r_to in end_nodes) or
+                  (r_to in middle_nodes and r_from in end_nodes)):
+                R2 = r_val
+
+        print(f"Debug: Final assignment - R1={R1}, R2={R2}, C1={C1}, C2={C2}, C3={C3}")
+
+        if R1 is not None and R2 is not None and R1 > 0 and R2 > 0 and C1 >= 0 and C2 >= 0 and C3 >= 0:
+            return R1, R2, C1, C2, C3
+
+    return None
+
+
+def apply_rules_reverse_linked_list(linked_list):
+    """
+    Apply upstream traversal rules using reverse linked list traversal.
+    Start from the last component (which should be a capacitor) and work backwards.
+    Returns y1, y2, y3, y4, y5 moments.
+    """
+    # First, collect all components into a list for reverse traversal
+    components = []
+    current = linked_list.head
+    while current:
+        components.append((current.component_type, current.value))
+        current = current.next
+
+    if not components:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    # Initialize moments at downstream end
+    y1 = y2 = y3 = y4 = y5 = 0.0
+
+    # Start from the last component (should be capacitor)
+    # Traverse in reverse order (upstream direction)
+    for i in range(len(components) - 1, -1, -1):
+        component_type, value = components[i]
+
+        if component_type == "C":  # Capacitor rule
+            y1 += value
+            # y2, y3, y4, y5 remain unchanged for capacitor
+
+        elif component_type == "R":  # Resistor rule
+            R = value
+            # Apply upstream resistor transformation rules
+            y1_new = y1  # y1 unchanged for resistor
+            y2_new = y2 - R * (y1 ** 2)
+            y3_new = y3 - 2.0 * R * y1 * y2 + (R ** 2) * (y1 ** 3)
+            y4_new = y4 - R * (2.0 * y1 * y3 + y2 ** 2) + 3.0 * (R ** 2) * (y1 ** 2) * y2 - (R ** 3) * (y1 ** 4)
+            y5_new = (y5
+                      - R * (2.0 * y1 * y4 + 2.0 * y2 * y3)
+                      + (R ** 2) * (3.0 * (y1 ** 2) * y3 + 3.0 * y1 * (y2 ** 2))
+                      - 4.0 * (R ** 3) * (y1 ** 3) * y2
+                      + (R ** 4) * (y1 ** 5))
+
+            y1, y2, y3, y4, y5 = y1_new, y2_new, y3_new, y4_new, y5_new
+
+    return y1, y2, y3, y4, y5
+
+
+def ladder_moments_up_to_5(Rs, Cs):
+    """
+    Compute the first five series coefficients of Y(s) at the driver:
+      Y(s) = y1 s + y2 s^2 + y3 s^3 + y4 s^4 + y5 s^5 + ...
+    Uses upstream traversal rules from the Double-Pi code.
+    This is a fallback when linked list is not used.
+    """
+    if len(Cs) != len(Rs) + 1:
+        # Handle flexible arrays - pad with zeros if needed
+        if len(Cs) < len(Rs) + 1:
+            Cs = Cs + [0.0] * (len(Rs) + 1 - len(Cs))
+        elif len(Rs) < len(Cs) - 1:
+            Rs = Rs + [0.0] * (len(Cs) - 1 - len(Rs))
+
+    # Start at far end (node N)
+    y1 = Cs[-1]
+    y2 = y3 = y4 = y5 = 0.0
+
+    # Walk upstream: for k = N-1..0
+    for k in range(len(Rs) - 1, -1, -1):
+        R = Rs[k]
+
+        # Cross series resistor
+        y1p = y1
+        y2p = y2 - R * (y1 ** 2)
+        y3p = y3 - 2.0 * R * y1 * y2 + (R ** 2) * (y1 ** 3)
+        y4p = y4 - R * (2.0 * y1 * y3 + y2 ** 2) + 3.0 * (R ** 2) * (y1 ** 2) * y2 - (R ** 3) * (y1 ** 4)
+        y5p = (y5
+               - R * (2.0 * y1 * y4 + 2.0 * y2 * y3)
+               + (R ** 2) * (3.0 * (y1 ** 2) * y3 + 3.0 * y1 * (y2 ** 2))
+               - 4.0 * (R ** 3) * (y1 ** 3) * y2
+               + (R ** 4) * (y1 ** 5))
+        y1, y2, y3, y4, y5 = y1p, y2p, y3p, y4p, y5p
+
+        # Then add the capacitor at this node k
+        if k < len(Cs):
+            y1 += Cs[k]
+
+    return y1, y2, y3, y4, y5
+
+
+def detect_exact_double_pi(Rs, Cs, tol=1e-12):
+    """
+    Detect if the network already represents a double-π structure.
+    Returns (R1, R2, C1, C2, C3) if exact, None otherwise.
+    (Fallback array-based method)
+    """
+    # Find non-zero resistors
+    nz_indices = [i for i, R in enumerate(Rs) if abs(R) >= tol]
+    if len(nz_indices) != 2:
+        return None
+
+    i1, i2 = nz_indices
+
+    # Ensure we have enough capacitors
+    if len(Cs) < 3:
+        return None
+
+    # Group capacitors based on resistor boundaries
+    if len(Cs) == len(Rs) + 1:
+        # Standard ladder format
+        N = len(Cs) - 1
+        C1 = sum(Cs[j] for j in range(0, i1 + 1))
+        C2 = sum(Cs[j] for j in range(i1 + 1, i2 + 1))
+        C3 = sum(Cs[j] for j in range(i2 + 1, N + 1))
+    else:
+        # Flexible format - divide into 3 sections
+        n_caps = len(Cs)
+        section_size = n_caps // 3
+        remainder = n_caps % 3
+
+        if remainder == 0:
+            b1, b2 = section_size, 2 * section_size
+        elif remainder == 1:
+            b1, b2 = section_size + 1, 2 * section_size + 1
+        else:  # remainder == 2
+            b1, b2 = section_size + 1, 2 * section_size + 2
+
+        C1 = sum(Cs[0:b1])
+        C2 = sum(Cs[b1:b2])
+        C3 = sum(Cs[b2:])
+
+    R1 = Rs[i1]
+    R2 = Rs[i2]
+
+    if R1 <= 0 or R2 <= 0 or C1 < 0 or C2 < 0 or C3 < 0:
+        return None
     return R1, R2, C1, C2, C3
 
 
-# ---------- generalized moments calculation ----------
-def calculate_moments_flexible(Rs, Cs):
+def solve_double_pi_symmetric(Rtot, Ctot, m1, m2, tol=1e-10):
     """
-    Calculate moments for flexible Rs and Cs arrays.
-    Uses upstream traversal rules similar to the original code.
+    Solve for symmetric double-π using moment matching.
+    Returns R1, R2, C1, C2, C3.
     """
-    # Initialize downstream values
-    y1, y2, y3 = 0.0, 0.0, 0.0
+    import math
 
-    # Process all capacitors first (can be done in any order for moment calculation)
-    for C in Cs:
-        y1 += C
-
-    # Process all resistors using upstream rules
-    for R in Rs:
-        if abs(R) > 1e-15:  # Skip zero resistors
-            y2 -= R * (y1 ** 2)
-            y3 -= 2.0 * R * y1 * y2 + (R ** 2) * (y1 ** 3)
-
-    return y1, y2, y3  # m0, m1, m2
-
-
-# ---------- moment-matched symmetric Double-π (robust) ----------
-def _k2_from(alpha, beta):
-    S = (1.0 - alpha)
-    a = alpha
-    b = beta
-    return (b ** 2) * (S ** 3) + 2 * b * (1 - b) * (S * (a ** 2)) + ((1 - b) ** 2) * (a ** 3)
-
-
-def solve_double_pi_sym(Rtot, Ctot, m1, m2, *, tol=1e-10):
     R, C = Rtot, Ctot
     if R <= 0 or C <= 0:
         raise ValueError("Totals must be positive.")
+
     k1 = -m1 / (R * C * C)
     k2_target = m2 / (R * R * C * C * C)
+
+    def _k2_from(alpha, beta):
+        S = (1.0 - alpha)
+        a = alpha
+        b = beta
+        return (b ** 2) * (S ** 3) + 2 * b * (1 - b) * (S * (a ** 2)) + ((1 - b) ** 2) * (a ** 3)
 
     def beta_from_alpha(alpha):
         d = 1.0 - 2.0 * alpha
@@ -132,11 +383,9 @@ def solve_double_pi_sym(Rtot, Ctot, m1, m2, *, tol=1e-10):
             best = (err, alpha, beta)
 
     if best is None:
+        # Passive fallback
         alpha = 0.25
-        beta = beta_from_alpha(alpha)
-        if beta is None or not math.isfinite(beta):
-            beta = 0.5
-        beta = min(0.999999, max(0.000001, beta))
+        beta = 0.5
         resid = float("inf")
         used_fallback = True
     else:
@@ -149,7 +398,7 @@ def solve_double_pi_sym(Rtot, Ctot, m1, m2, *, tol=1e-10):
     R2 = (1.0 - beta) * R
 
     if C1 <= 0 or C2 < 0 or C3 <= 0 or R1 <= 0 or R2 <= 0:
-        alpha = 0.25;
+        alpha = 0.25
         beta = 0.5
         C1 = C3 = alpha * C
         C2 = (1.0 - 2.0 * alpha) * C
@@ -158,186 +407,193 @@ def solve_double_pi_sym(Rtot, Ctot, m1, m2, *, tol=1e-10):
         resid = float("inf")
         used_fallback = True
 
-    return R1, R2, C1, C2, C3, (resid if math.isfinite(resid) else None), used_fallback
+    return R1, R2, C1, C2, C3, used_fallback
 
 
-# ---------- SPICE deck (golden vs Double-π) ----------
-def write_spice_double_pi(path, Rs, Cs, Rdrv, R1, R2, C1, C2, C3,
-                          VDD=1.0, tr="1p", tf="1p", pw="50p", per="100p",
-                          tstep="1p", tstop="2n"):
-    with open(path, "w") as f:
-        f.write("* GOLDEN network vs Double-PI (GUI)\n")
-        f.write(f".param VDD={VDD}\n")
-        f.write(f"VSTEP in 0 PULSE(0 'VDD' 0 {tr} {tf} {pw} {per})\n")
+def generate_double_pi_spice_file(input_file, output_file, R1, R2, C1, C2, C3):
+    """
+    Generate new SPICE file with Double-π model replacing the original RC network.
+    """
+    # Read the original file to preserve structure and content
+    with open(input_file, "r") as f:
+        original_lines = f.readlines()
 
-        f.write("\n* --- GOLDEN network ---\n")
-        f.write(f"RDRV_G in ng0 {Rdrv:g}\n")
+    # Process the file by identifying different sections
+    subckt_lines = []
+    subckt_section = False
+    inverter_ends_found = False
 
-        # Write capacitors - ensure we have nodes for them
-        for i, Ci in enumerate(Cs):
-            if Ci > 0:  # Only write non-zero capacitors
-                f.write(f"CG{i} ng{i} 0 {Ci:g}\n")
+    header_lines = []
+    circuit_lines = []
+    rc_section_found = False
+    footer_lines = []
 
-        # Write resistors - ensure proper node connectivity
-        last_node = len(Cs) - 1
-        for i, Ri in enumerate(Rs):
-            if i < last_node:  # Don't create nodes beyond what we have
-                if Ri != 0:  # Only write non-zero resistors
-                    f.write(f"RG{i} ng{i} ng{i + 1} {Ri:g}\n")
-                else:
-                    # For zero resistors, create a very small resistance to avoid shorts
-                    f.write(f"RG{i} ng{i} ng{i + 1} 1m\n")
+    # Find the node where the RC network begins
+    start_node = "1"  # Default if we can't determine
 
-        f.write("\n* --- Double-PI ---\n")
-        f.write(f"RDRV_P in np0 {Rdrv:g}\n")
-        f.write(f"R1 np0 np1 {R1:g}\n")
-        f.write(f"R2 np1 np2 {R2:g}\n")
-        f.write(f"C1 np0 0 {C1:g}\n")
-        f.write(f"C2 np1 0 {C2:g}\n")
-        f.write(f"C3 np2 0 {C3:g}\n")
+    for line in original_lines:
+        line_stripped = line.strip()
 
-        f.write(f"\n.tran {tstep} {tstop}\n")
-        f.write(f".measure tran t50_golden TRIG v(in) VAL='VDD/2' RISE=1 TARG v(ng{last_node}) VAL='VDD/2' RISE=1\n")
-        f.write(f".measure tran t50_dpi    TRIG v(in) VAL='VDD/2' RISE=1 TARG v(np2) VAL='VDD/2' RISE=1\n")
-        f.write(f".probe v(in) v(ng{last_node}) v(np2)\n")
-        f.write(".end\n")
+        # Handle subcircuit section
+        if line_stripped.startswith(".subckt"):
+            subckt_section = True
+            subckt_lines.append(line)
+        elif subckt_section and not inverter_ends_found and line_stripped.startswith(".ends"):
+            subckt_lines.append(line)
+            subckt_section = False
+            inverter_ends_found = True
+        elif subckt_section:
+            subckt_lines.append(line)
+
+        # Handle other sections
+        elif line_stripped.startswith(".temp") or line_stripped.startswith(".lib"):
+            header_lines.append(line)
+        elif line_stripped.startswith("xi0") or line_stripped.startswith("vdd") or line_stripped.startswith("vin"):
+            circuit_lines.append(line)
+            # Try to find the output node of the inverter
+            if line_stripped.startswith("xi0"):
+                parts = line_stripped.split()
+                if len(parts) >= 5:
+                    start_node = parts[4]  # Output node of inverter
+        elif line_stripped.startswith("R") or line_stripped.startswith("C"):
+            rc_section_found = True
+        elif line_stripped.startswith(".tran") or line_stripped.startswith(".options") or line_stripped.startswith(
+                ".end"):
+            footer_lines.append(line)
+
+    # Create the new file with Double-π model
+    with open(output_file, "w") as f:
+        # Write header with comment
+        f.write("*****\n****Double-π RC Network****\n******\n")
+
+        # Write header lines
+        for line in header_lines:
+            f.write(line)
+
+        # Write subcircuit definition
+        for line in subckt_lines:
+            f.write(line)
+
+        # Write circuit components before RC network
+        for line in circuit_lines:
+            f.write(line)
+
+        # Write Double-π model components
+        f.write(f"R1 {start_node} 2 {R1:.6g}\n")
+        f.write(f"R2 2 3 {R2:.6g}\n")
+        f.write(f"C1 {start_node} 0 {C1:.6g}\n")
+        f.write(f"C2 2 0 {C2:.6g}\n")
+        f.write(f"C3 3 0 {C3:.6g}\n")
+
+        # Write footer
+        for line in footer_lines:
+            f.write(line)
+
+        # Ensure there's an .end statement if none was found
+        if not any(line.strip().startswith(".end") for line in footer_lines):
+            f.write(".end\n")
 
 
-# ---------- GUI ----------
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Flexible Double-π Model")
-        self.geometry("780x540")
-        self.resizable(False, False)
+def save_double_pi_values(y1, y2, y3, y4, y5, R1, R2, C1, C2, C3, is_exact=False):
+    """
+    Save Double-π model values and moments to a text file.
+    """
+    with open("double_pi_values.txt", "w") as f:
+        f.write("Double-π Model Values:\n")
+        f.write("=" * 30 + "\n")
+        f.write(f"Method: {'Exact' if is_exact else 'Moment-matched fit'}\n\n")
 
-        r = 0
-        tk.Label(self, text="Series Rs (ohm, comma-separated):").grid(row=r, column=0, sticky="w", padx=10, pady=8)
-        self.rs_entry = tk.Entry(self, width=70);
-        self.rs_entry.insert(0, "10,20,30")
-        self.rs_entry.grid(row=r, column=1, padx=10, pady=8);
-        r += 1
+        f.write("Y(s) Series Coefficients (Moments):\n")
+        f.write(f"y1 = {y1:.6g}\n")
+        f.write(f"y2 = {y2:.6g}\n")
+        f.write(f"y3 = {y3:.6g}\n")
+        f.write(f"y4 = {y4:.6g}\n")
+        f.write(f"y5 = {y5:.6g}\n\n")
 
-        tk.Label(self, text="Shunt Cs (F, comma-separated):").grid(row=r, column=0, sticky="w", padx=10, pady=8)
-        self.cs_entry = tk.Entry(self, width=70);
-        self.cs_entry.insert(0, "1e-12,2e-12,3e-12,4e-12")
-        self.cs_entry.grid(row=r, column=1, padx=10, pady=8);
-        r += 1
+        f.write("Final Double-π Component Values:\n")
+        f.write(f"R1 = {R1:.6g} Ω\n")
+        f.write(f"R2 = {R2:.6g} Ω\n")
+        f.write(f"C1 = {C1:.6g} F\n")
+        f.write(f"C2 = {C2:.6g} F\n")
+        f.write(f"C3 = {C3:.6g} F\n")
 
-        tk.Label(self, text="Driver Rdrv (ohm):").grid(row=r, column=0, sticky="w", padx=10, pady=8)
-        self.rdrv_entry = tk.Entry(self, width=18);
-        self.rdrv_entry.insert(0, "100")
-        self.rdrv_entry.grid(row=r, column=1, sticky="w", padx=10, pady=8);
-        r += 1
 
-        tk.Label(self, text="VDD (V):").grid(row=r, column=0, sticky="w", padx=10, pady=8)
-        self.vdd_entry = tk.Entry(self, width=18);
-        self.vdd_entry.insert(0, "1.0")
-        self.vdd_entry.grid(row=r, column=1, sticky="w", padx=10, pady=8);
-        r += 1
+# Main execution flow
+def main():
+    input_file = "rc_network.sp"
+    output_file = "rc_network_double_pi_model.sp"
 
-        tk.Label(self, text="Transient (tstep / tstop):").grid(row=r, column=0, sticky="w", padx=10, pady=8)
-        tfrm = tk.Frame(self);
-        tfrm.grid(row=r, column=1, sticky="w", padx=10, pady=8)
-        tk.Label(tfrm, text="tstep").grid(row=0, column=0)
-        self.tstep_entry = tk.Entry(tfrm, width=12);
-        self.tstep_entry.insert(0, "1p");
-        self.tstep_entry.grid(row=0, column=1, padx=6)
-        tk.Label(tfrm, text="tstop").grid(row=0, column=2)
-        self.tstop_entry = tk.Entry(tfrm, width=12);
-        self.tstop_entry.insert(0, "2n");
-        self.tstop_entry.grid(row=0, column=3, padx=6)
-        r += 1
+    try:
+        # Parse the SPICE file
+        print("Parsing SPICE file...")
+        linked_list, Rs, Cs, components = parse_hspice_file(input_file)
 
-        tk.Button(self, text="Compute Double-π", command=self.compute).grid(row=r, column=0, sticky="w", padx=10,
-                                                                            pady=12)
-        self.res_var = tk.StringVar(value="R1=?, R2=?\nC1=?, C2=?, C3=?")
-        tk.Label(self, textvariable=self.res_var, font=("Segoe UI", 11, "bold"),
-                 justify="left").grid(row=r, column=1, sticky="w", padx=10, pady=12)
-        r += 1
+        print(f"Found {len(Rs)} resistors and {len(Cs)} capacitors")
+        print(f"Resistors: {Rs}")
+        print(f"Capacitors: {Cs}")
+        print(f"Components with nodes: {components}")
 
-        # Add info label
-        info_text = "Note: This version accepts any number of Rs and Cs independently.\nNo requirement for len(Cs) = len(Rs) + 1."
-        tk.Label(self, text=info_text, font=("Segoe UI", 9), fg="blue",
-                 justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=10, pady=8)
-        r += 1
+        # Calculate Y(s) moments using proper reverse linked list traversal
+        print("\nCalculating Y(s) moments using reverse linked list traversal...")
+        y1, y2, y3, y4, y5 = apply_rules_reverse_linked_list(linked_list)
 
-        tk.Button(self, text="Save SPICE deck…", command=self.save_spice).grid(row=r, column=0, sticky="w", padx=10,
-                                                                               pady=8)
-        self.current = None  # (R1,R2,C1,C2,C3,Rs,Cs,Rdrv,VDD, from_exact)
+        print("Y(s) Series Coefficients (from linked list):")
+        print(f"y1 = {y1:.6g}")
+        print(f"y2 = {y2:.6g}")
+        print(f"y3 = {y3:.6g}")
+        print(f"y4 = {y4:.6g}")
+        print(f"y5 = {y5:.6g}")
 
-    def compute(self):
-        try:
-            Rs = parse_list(self.rs_entry.get())
-            Cs = parse_list(self.cs_entry.get())
+        # Try exact detection using SPICE topology analysis first
+        print("\nChecking for exact Double-π structure using topology analysis...")
+        exact_result = detect_exact_double_pi_from_spice(components)
 
-            # Remove the restriction - allow any number of Rs and Cs
-            if not Rs and not Cs:
-                raise ValueError("Please enter at least one resistor or capacitor value.")
-
-            # Handle empty arrays
-            if not Rs:
-                Rs = [0.0]  # Add a dummy zero resistor
-            if not Cs:
-                Cs = [1e-15]  # Add a tiny dummy capacitor
-
-            Rdrv = float(self.rdrv_entry.get().strip());
-            VDD = float(self.vdd_entry.get().strip())
-
-            # 1) try exact detection (simplified for flexible arrays)
-            exact = None
-            if len(Rs) >= 2:  # Need at least 2 resistors for double-π
-                exact = detect_exact_double_pi(Rs, Cs)
-
-            if exact is not None:
-                R1, R2, C1, C2, C3 = exact
-                from_exact = True
+        if exact_result is not None:
+            R1, R2, C1, C2, C3 = exact_result
+            is_exact = True
+            print("Found exact Double-π structure using topology analysis!")
+        else:
+            # Fallback: try array-based detection
+            print("Topology analysis failed, trying array-based exact detection...")
+            exact_result = detect_exact_double_pi(Rs, Cs)
+            if exact_result is not None:
+                R1, R2, C1, C2, C3 = exact_result
+                is_exact = True
+                print("Found exact Double-π structure using array method!")
             else:
-                # 2) otherwise moment-matched symmetric fallback
-                m0, m1, m2 = calculate_moments_flexible(Rs, Cs)
+                # Use moment-matched symmetric approach
+                print("Using moment-matched symmetric Double-π...")
                 Rtot, Ctot = sum(Rs), sum(Cs)
-
-                if Rtot <= 0:
-                    Rtot = 1.0  # Set minimum resistance
-                if Ctot <= 0:
-                    Ctot = 1e-15  # Set minimum capacitance
-
-                R1, R2, C1, C2, C3, resid, used_fallback = solve_double_pi_sym(Rtot, Ctot, m1, m2)
-                from_exact = False
+                m1, m2 = y2, y3  # Use y2, y3 as m1, m2 from linked list calculation
+                R1, R2, C1, C2, C3, used_fallback = solve_double_pi_symmetric(Rtot, Ctot, m1, m2)
+                is_exact = False
                 if used_fallback:
-                    messagebox.showwarning(
-                        "Note",
-                        "Exact symmetric Double-π match wasn't feasible.\n"
-                        "Returned a best-effort passive fit."
-                    )
+                    print("Warning: Used fallback passive fit")
 
-            self.current = (R1, R2, C1, C2, C3, Rs, Cs, Rdrv, VDD, from_exact)
-            tag = " (exact)" if from_exact else " (fit)"
-            self.res_var.set(f"R1 = {R1:.6g} Ω,  R2 = {R2:.6g} Ω{tag}\n"
-                             f"C1 = {C1:.6g} F\nC2 = {C2:.6g} F\nC3 = {C3:.6g} F")
-        except Exception as e:
-            messagebox.showerror("Input error", str(e))
+        # Print final results
+        print("\nFinal Double-π Component Values:")
+        print(f"R1 = {R1:.6g} Ω")
+        print(f"R2 = {R2:.6g} Ω")
+        print(f"C1 = {C1:.6g} F")
+        print(f"C2 = {C2:.6g} F")
+        print(f"C3 = {C3:.6g} F")
+        print(f"Method: {'Exact' if is_exact else 'Moment-matched fit'}")
 
-    def save_spice(self):
-        if self.current is None:
-            self.compute()
-            if self.current is None:
-                return
-        R1, R2, C1, C2, C3, Rs, Cs, Rdrv, VDD, _ = self.current
-        path = filedialog.asksaveasfilename(
-            defaultextension=".sp", initialfile="double_pi_vs_golden.sp",
-            filetypes=[("SPICE files", "*.sp;*.cir;*.ckt"), ("All files", "*.*")]
-        )
-        if not path:
-            return
-        try:
-            write_spice_double_pi(Path(path), Rs, Cs, Rdrv, R1, R2, C1, C2, C3,
-                                  VDD=VDD, tstep=self.tstep_entry.get().strip() or "1p",
-                                  tstop=self.tstop_entry.get().strip() or "2n")
-            messagebox.showinfo("Saved", f"SPICE deck written:\n{path}\n\nMeasures t50_golden vs t50_dpi.")
-        except Exception as e:
-            messagebox.showerror("Save error", str(e))
+        # Generate the new SPICE file with Double-π model
+        print(f"\nGenerating Double-π SPICE file: {output_file}")
+        generate_double_pi_spice_file(input_file, output_file, R1, R2, C1, C2, C3)
+
+        # Save results to a file (use linked list moments)
+        save_double_pi_values(y1, y2, y3, y4, y5, R1, R2, C1, C2, C3, is_exact)
+        print("Results saved to double_pi_values.txt")
+
+        print(f"\nDouble-π model generation completed successfully!")
+
+    except FileNotFoundError:
+        print(f"Error: Input file '{input_file}' not found.")
+    except Exception as e:
+        print(f"Error: {str(e)}")
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    main()
